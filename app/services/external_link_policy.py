@@ -377,18 +377,22 @@ def source_evaluations(db: Session, source_site: Site) -> list[dict]:
     return items
 
 
-def expire_ineligible_external_suggestions(
+ExternalSafetyEvaluation = TrustEvaluation | WebSearchSafetyEvaluation
+IneligibleExternalSuggestion = tuple[Suggestion, ExternalSafetyEvaluation, str]
+
+
+def ineligible_external_suggestions(
     db: Session,
     source_site: Site,
     *,
     statuses: tuple[str, ...] = ("pending", "approved"),
-    actor: str,
+    policy: PolicyState | None = None,
     publication_plan_ids: tuple[int, ...] | None = None,
-) -> int:
-    """Expire old rows that no longer satisfy the current external policy."""
+) -> list[IneligibleExternalSuggestion]:
+    """Read the exact rows a policy would expire, without changing them."""
     if publication_plan_ids is not None and not publication_plan_ids:
-        return 0
-    policy = policy_state(db, source_site.id)
+        return []
+    effective_policy = policy or policy_state(db, source_site.id)
     owned = managed_domains(db)
     query = (
         select(Suggestion)
@@ -396,7 +400,10 @@ def expire_ineligible_external_suggestions(
             Suggestion.site_id == source_site.id,
             Suggestion.status.in_(statuses),
         )
-        .options(joinedload(Suggestion.target_article))
+        .options(
+            joinedload(Suggestion.source_article),
+            joinedload(Suggestion.target_article),
+        )
     )
     if publication_plan_ids is not None:
         query = query.where(Suggestion.publication_plan_id.in_(publication_plan_ids))
@@ -407,14 +414,13 @@ def expire_ineligible_external_suggestions(
     target_sites = {
         site.id: site for site in db.scalars(select(Site).where(Site.id.in_(target_site_ids))).all()
     }
-    expired = 0
-    now = datetime.now(UTC)
+    ineligible: list[IneligibleExternalSuggestion] = []
     for suggestion in suggestions:
         if suggestion.external_url is not None:
             evaluation = evaluate_web_search_url(
                 source_site=source_site,
                 target_url=suggestion.external_url,
-                policy=policy,
+                policy=effective_policy,
                 owned_domains=owned,
             )
             details_key = "external_safety"
@@ -429,12 +435,33 @@ def expire_ineligible_external_suggestions(
                 source_site=source_site,
                 target_site=target_site,
                 target_url=target.url,
-                policy=policy,
+                policy=effective_policy,
                 owned_domains=owned,
             )
             details_key = "external_trust"
         if evaluation.eligible:
             continue
+        ineligible.append((suggestion, evaluation, details_key))
+    return ineligible
+
+
+def expire_ineligible_external_suggestions(
+    db: Session,
+    source_site: Site,
+    *,
+    statuses: tuple[str, ...] = ("pending", "approved"),
+    actor: str,
+    publication_plan_ids: tuple[int, ...] | None = None,
+) -> int:
+    """Expire old rows that no longer satisfy the current external policy."""
+    ineligible = ineligible_external_suggestions(
+        db,
+        source_site,
+        statuses=statuses,
+        publication_plan_ids=publication_plan_ids,
+    )
+    now = datetime.now(UTC)
+    for suggestion, evaluation, details_key in ineligible:
         previous = suggestion.status
         suggestion.status = "expired"
         db.add(
@@ -450,8 +477,7 @@ def expire_ineligible_external_suggestions(
                 created_at=now,
             )
         )
-        expired += 1
-    return expired
+    return len(ineligible)
 
 
 def recheck_external_suggestions_before_publication(
@@ -579,8 +605,23 @@ def recheck_external_suggestions_before_publication(
                 )
                 continue
 
-            previous = suggestion.status
-            suggestion.status = "expired"
+            # The check ran outside any lock — deliberately, because it is an
+            # HTTP request — so the row may have moved on while it was in
+            # flight. Take the row lock now, after the network work and for the
+            # few microseconds until commit, and expire only what is still in
+            # the status this gate was asked about: another worker's 'applied'
+            # must not be overwritten by an observation that started earlier.
+            current = db.scalars(
+                select(Suggestion)
+                .where(Suggestion.id == suggestion.id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            ).first()
+            if current is None or current.status not in statuses:
+                continue
+
+            previous = current.status
+            current.status = "expired"
             expired += 1
             db.add(
                 SuggestionEvent(
